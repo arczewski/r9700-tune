@@ -852,23 +852,33 @@ func extractVBios(args []string) error {
 	}
 
 	var rom []byte
+	var romSrc string
 	if pci != "" {
 		if os.Geteuid() != 0 {
 			fatal("--pci needs root")
 		}
-		romPath := fmt.Sprintf("/sys/bus/pci/devices/%s/rom", pci)
-		if _, err := os.Stat(romPath); err != nil {
-			fatal("cannot access %s: %v", romPath, err)
-		}
-		fmt.Printf("Reading VBIOS via %s ...\n", romPath)
-		if err := os.WriteFile(romPath, []byte("1"), 0o644); err != nil {
-			fatal("could not enable PCI ROM read: %v", err)
-		}
-		defer os.WriteFile(romPath, []byte("0"), 0o644)
-		var err error
-		rom, err = os.ReadFile(romPath)
-		if err != nil {
-			fatal("could not read PCI ROM: %v", err)
+		// preferred: full VBIOS from kernel memory via debugfs blob
+		dbgPath := fmt.Sprintf("/sys/kernel/debug/dri/%s/amdgpu_vbios", pci)
+		if d, err := os.ReadFile(dbgPath); err == nil && len(d) > 0x100 {
+			rom = d
+			romSrc = dbgPath
+		} else {
+			// fallback: PCI ROM BAR
+			romPath := fmt.Sprintf("/sys/bus/pci/devices/%s/rom", pci)
+			if _, err := os.Stat(romPath); err != nil {
+				fatal("cannot access %s: %v", romPath, err)
+			}
+			fmt.Printf("Reading VBIOS via %s ...\n", romPath)
+			if err := os.WriteFile(romPath, []byte("1"), 0o644); err != nil {
+				fatal("could not enable PCI ROM read: %v", err)
+			}
+			defer os.WriteFile(romPath, []byte("0"), 0o644)
+			var err error
+			rom, err = os.ReadFile(romPath)
+			if err != nil {
+				fatal("could not read PCI ROM: %v", err)
+			}
+			romSrc = romPath
 		}
 	} else {
 		if input == "" {
@@ -879,8 +889,10 @@ func extractVBios(args []string) error {
 		if err != nil {
 			return err
 		}
+		romSrc = input
 	}
 
+	fmt.Printf("VBIOS source: %s (%d bytes)\n", romSrc, len(rom))
 	if len(rom) < 0x100 {
 		fatal("ROM image too small (%d bytes)", len(rom))
 	}
@@ -913,27 +925,47 @@ func extractVBios(args []string) error {
 		return off, true
 	}
 
+	// diagnostics: list all populated entries
+	fmt.Println("Master data table entries (idx: offset -> size/frev.crev):")
+	found := 0
+	for idx := 0; idx < 64; idx++ {
+		if off, ok := find(idx); ok {
+			fmt.Printf("  [%2d] 0x%04x -> %d / %d.%d\n", idx, off,
+				u16(rom, off), rom[off+2], rom[off+3])
+			found++
+		}
+	}
+	if found == 0 {
+		fmt.Println("  (no in-range entries - master table offsets likely relative, not absolute)")
+	}
+
+	// try to locate the PowerPlay table
 	var tableOff int
-	// preferred: index 15 (powerplayinfo in master list v2.1)
-	if off, ok := find(15); ok {
-		tableOff = off
-	} else {
-		// fallback: scan all entries for a table with structuresize 5812 / frev 23
-		tableOff = 0
-		for idx := 0; idx < 64; idx++ {
-			off, ok := find(idx)
-			if !ok {
-				continue
-			}
-			if int(u16(rom, off)) == fullSize && rom[off+2] == 23 {
-				tableOff = off
-				fmt.Printf("powerplayinfo not at index 15; found at index %d (offset 0x%x)\n", idx, off)
-				break
+	candidates := []int{}
+	if off, ok := find(15); ok && int(u16(rom, off)) >= 4096 {
+		candidates = append(candidates, off)
+	}
+	for idx := 0; idx < 64; idx++ {
+		if off, ok := find(idx); ok {
+			if int(u16(rom, off)) == fullSize {
+				candidates = append(candidates, off)
 			}
 		}
 	}
+
+	for _, off := range candidates {
+		sz := int(u16(rom, off))
+		if sz >= 4096 && off+sz <= len(rom) {
+			tableOff = off
+			break
+		}
+	}
+
 	if tableOff == 0 {
-		fatal("could not locate the PowerPlay table in this ROM image")
+		fatal("could not locate a complete PowerPlay table in this ROM image.\n"+
+			"If entries above are valid but the tables are beyond the image size,\n"+
+			"the ROM read was truncated - try the debugfs path (--pci reads it\n"+
+			"first) or dump the VBIOS with amdvbflash.")
 	}
 
 	size := int(u16(rom, tableOff))
@@ -942,9 +974,6 @@ func extractVBios(args []string) error {
 		tableOff, size, frev, crev)
 	if tableOff+size > len(rom) {
 		fatal("table (%d bytes @0x%x) exceeds ROM size (%d)", size, tableOff, len(rom))
-	}
-	if size < 4096 {
-		fatal("unexpected table size %d - refusing", size)
 	}
 
 	out := append([]byte(nil), rom[tableOff:tableOff+size]...)

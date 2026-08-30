@@ -30,7 +30,7 @@ fi
 
 SIZE=$(wc -c < "$TABLE")
 echo "Uploading $TABLE ($SIZE bytes) ..."
-if ! cat "$TABLE" > "$GPU/pp_table"; then
+if ! dd if="$TABLE" of="$GPU/pp_table" bs=1M status=none 2>/dev/null; then
     echo "ERROR: pp_table upload failed"
     exit 1
 fi

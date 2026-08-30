@@ -13,11 +13,11 @@ package main
 
 import (
 	"encoding/binary"
-
 	"fmt"
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 var version = "dev"
@@ -379,7 +379,7 @@ func patch(args []string) error {
 	pptFloor := 0
 	fanTarget := 0
 	acousticLimit := 0
-	resize := fullSize
+	resize := 0
 	input := ""
 
 	nextVal := func(a, flagName string, i *int) string {
@@ -467,12 +467,42 @@ func patch(args []string) error {
 	csku := pp + cskuInPP
 	fmt.Printf("input %s: %d bytes, structuresize=%d, pp@0x%x\n", input, origLen, structureSize, pp)
 
-	if origLen < resize {
-		fmt.Printf("extending blob from %d to %d bytes (zero-filled tail)\n", origLen, resize)
-		b = append(b, make([]byte, resize-origLen)...)
-		putU16(b, 0, resize)
-		fmt.Printf("structuresize updated %d -> %d\n", structureSize, resize)
-		structureSize = resize
+	// Highest offset any selected patch will touch.
+	needed := 0
+	if maxSclk != 0 {
+		needed = max(needed, sku+2576+6) // BoostClockAc
+	}
+	if powerLimit != 0 {
+		needed = max(needed, csku+284) // SocketPowerLimitSmartShift2
+		needed = max(needed, sku+2604+16)
+	}
+	if pptFloor != 0 {
+		needed = max(needed, sku+2816+4)
+	}
+	if fanTarget != 0 {
+		needed = max(needed, csku+136+24)
+	}
+	if acousticLimit != 0 {
+		needed = max(needed, csku+122)
+	}
+	if unlockOD {
+		needed = max(needed, sku+2816+96)
+	}
+
+	if needed > len(b) {
+		if resize > len(b) && resize >= needed {
+			fmt.Printf("WARNING: patches need table offset %d but the blob is %d bytes.\n", needed, len(b))
+			fmt.Printf("Extending blob to %d bytes. The SMU may reject an extended table on some\ncards; test carefully and check dmesg after applying.\n", resize)
+			b = append(b, make([]byte, resize-len(b))...)
+			putU16(b, 0, resize)
+			fmt.Printf("structuresize updated %d -> %d\n", structureSize, resize)
+			structureSize = resize
+		} else {
+			fatal("patches need table offset %d but the blob is only %d bytes.\n"+
+				"Options:\n"+
+				"  - apply only fields that exist in this dump (e.g. --max-sclk alone)\n"+
+				"  - or pass --resize %d to attempt an extended-table upload", needed, len(b), fullSize)
+		}
 	}
 
 	var changes []string
@@ -695,9 +725,94 @@ func patch(args []string) error {
 		fmt.Printf("  echo 210000000 > %s/power1_cap   (or your chosen value)\n", gpu)
 	} else {
 		fmt.Println("Apply it with (as root):")
-		fmt.Printf("  cat %s > %s/pp_table\n", outName, gpu)
-		fmt.Printf("  echo auto > %s/power_dpm_force_performance_level\n", gpu)
+		fmt.Printf("  r9700-tune apply %s --power-cap 200\n", outName)
+		fmt.Println("  (never use cat/echo redirection for the binary table - the kernel")
+		fmt.Println("   needs the whole table in one write syscall)")
 		fmt.Println("Revert any time by rebooting (runtime-only change).")
+	}
+	return nil
+}
+
+func applyTable(args []string) error {
+	gpu := "/sys/class/drm/card0/device"
+	powerCap := 0
+	perfLevel := "auto"
+	input := ""
+
+	nextVal := func(a string, i *int) string {
+		if *i+1 >= len(args) {
+			fatal("missing value for %s", a)
+		}
+		*i++
+		return args[*i]
+	}
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--gpu":
+			gpu = nextVal(a, &i)
+		case strings.HasPrefix(a, "--gpu="):
+			gpu = strings.TrimPrefix(a, "--gpu=")
+		case a == "--power-cap":
+			powerCap = atoi(nextVal(a, &i), a)
+		case strings.HasPrefix(a, "--power-cap="):
+			powerCap = atoi(strings.TrimPrefix(a, "--power-cap="), "--power-cap")
+		case a == "--perf-level":
+			perfLevel = nextVal(a, &i)
+		case strings.HasPrefix(a, "--perf-level="):
+			perfLevel = strings.TrimPrefix(a, "--perf-level=")
+		case a == "-h" || a == "--help":
+			usage()
+			os.Exit(0)
+		case strings.HasPrefix(a, "-") && a != "-":
+			fatal("unknown flag %s", a)
+		default:
+			if input != "" {
+				fatal("multiple input files: %s and %s", input, a)
+			}
+			input = a
+		}
+	}
+
+	if input == "" {
+		return fmt.Errorf("usage: r9700-tune apply [flags] <pp_table.bin>")
+	}
+
+	b, err := os.ReadFile(input)
+	if err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		fatal("apply needs root")
+	}
+	if len(b) < 2 || int(u16(b, 0)) != len(b) {
+		fatal("refusing: structuresize header (%d) does not match file size (%d). The kernel would reject it with EIO.", u16(b, 0), len(b))
+	}
+
+	// Single write(2) syscall - the kernel validates the whole table in one
+	// write, so never use cat/echo redirection for the binary table.
+	sysfs := fmt.Sprintf("%s/pp_table", strings.TrimRight(gpu, "/"))
+	if err := os.WriteFile(sysfs, b, 0o644); err != nil {
+		return fmt.Errorf("upload failed: %w\ncheck dmesg: 'pp table size not matched' means the write was chunked; 'smu reset failed' means the SMU rejected the table", err)
+	}
+	fmt.Printf("Uploaded %s (%d bytes) - SMU reset done.\n", input, len(b))
+
+	time.Sleep(2 * time.Second)
+
+	if err := os.WriteFile(gpu+"/power_dpm_force_performance_level", []byte(perfLevel), 0o644); err != nil {
+		fmt.Printf("warning: could not set performance level %q: %v\n", perfLevel, err)
+	} else {
+		fmt.Printf("Performance level set to %q.\n", perfLevel)
+	}
+
+	if powerCap > 0 {
+		val := fmt.Sprintf("%d", powerCap*1000000)
+		if err := os.WriteFile(gpu+"/power1_cap", []byte(val), 0o644); err != nil {
+			fmt.Printf("warning: could not set power1_cap: %v\n", err)
+		} else {
+			fmt.Printf("power1_cap set to %d W.\n", powerCap)
+		}
 	}
 	return nil
 }
@@ -708,19 +823,26 @@ func usage() {
 Usage:
   r9700-tune analyze <pp_table.bin>          decode and explain a pp_table dump
   r9700-tune patch [flags] <pp_table.bin>    patch power/clock/fan values
+  r9700-tune apply [flags] <pp_table.bin>    upload a table to the GPU (single write)
   r9700-tune version                         print version
+
+Apply flags:
+  --gpu <path>       GPU sysfs path (default /sys/class/drm/card0/device)
+  --power-cap <W>    also set power1_cap after upload (e.g. 200)
+  --perf-level <lvl> performance level to re-apply (default auto)
 
 Patch flags:
   -o <file>                 output file (default: patched_pp_table.bin)
   --apply                   also upload to the GPU sysfs pp_table node (root)
-  --gpu <path>              GPU sysfs path (default /sys/class/drm/card0/device)
+  --gpu <path>              GPU sysfs path for --apply
   --max-sclk <MHz>          cap max SCLK via GameClockAc (e.g. 2200)
   --power-limit <W>         lower SMU board power limit (e.g. 170)
   --ppt-floor <W>           lower the power1_cap sysfs floor (e.g. 150)
   --fan-target-temp <C>     SMU fan target temperature (e.g. 82)
   --acoustic-limit-rpm <N>  SMU acoustic RPM limit (e.g. 1500)
   --unlock-od               set OD FeatureCtrlMasks (VBIOS-flash prep)
-  --resize <N>              blob size when extending a short dump (default %d)
+  --resize <N>              extend a short dump to N bytes before patching
+                            (default: never extend; use 5812 to try a full table)
 
 All patches are runtime-only (pp_table upload + SMU reset). Reboot = revert.
 `, version, fullSize)
@@ -741,6 +863,8 @@ func main() {
 		err = analyze(os.Args[2])
 	case "patch":
 		err = patch(os.Args[2:])
+	case "apply":
+		err = applyTable(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("r9700-tune %s\n", version)
 	case "help", "-h", "--help":

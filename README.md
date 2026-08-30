@@ -50,24 +50,44 @@ r9700-tune analyze /tmp/pp.bin
 Prints every relevant field (power limits, DPM config, fan table, OD masks)
 and a verdict explaining exactly why the OD interface is hidden on your card.
 
-### Patch
+### Patch and apply
 
 ```bash
 # cap max SCLK at 2200 MHz and lower the SMU power limit to 170 W
 r9700-tune patch /tmp/pp.bin -o patched.bin --max-sclk 2200 --power-limit 170
 
-# apply live (root) - uploads to the SMU and resets it
+# upload a table to the GPU (root, single write) and set power cap
+r9700-tune apply patched.bin --power-cap 200
+
+# or patch + upload in one step
 r9700-tune patch /tmp/pp.bin --apply --max-sclk 2200 --power-limit 170
 
 # lower the power1_cap sysfs floor, then use power1_cap directly
 r9700-tune patch /tmp/pp.bin -o patched.bin --ppt-floor 150
-cat patched.bin > /sys/class/drm/card0/device/pp_table
-echo 150000000 > /sys/class/drm/card0/device/power1_cap
+r9700-tune apply patched.bin --power-cap 150
 ```
 
 Flags: `--max-sclk`, `--power-limit`, `--ppt-floor`, `--fan-target-temp`,
 `--acoustic-limit-rpm`, `--unlock-od` (VBIOS-flash prep), `--apply`, `--gpu`,
-`--resize`, `-o`.
+`--resize`, `-o`. `apply` flags: `--gpu`, `--power-cap <W>`, `--perf-level`.
+
+### Important gotchas
+
+- **Never upload the table with `cat file > /sys/.../pp_table`.** The kernel
+  accepts the table only as a single write syscall whose length matches the
+  `structuresize` header; `cat` on vfat writes in 4096-byte chunks and gets
+  `EIO` (`pp table size not matched` in dmesg). Use `r9700-tune apply`, or
+  `dd if=patched.bin of=/sys/.../pp_table bs=1M` as a fallback.
+- **Short dumps:** some cards expose a 4096-byte table (fields beyond offset
+  4096 are simply absent from the VBIOS and read as zero by the driver).
+  `--max-sclk` works on such dumps. Patches that need the tail
+  (`--power-limit`, `--ppt-floor`, fan flags) require `--resize 5812`,
+  which fabricates the missing fields - the SMU may accept or reject that,
+  so test with dmesg after applying. When in doubt, prefer `--max-sclk`
+  alone plus `power1_cap`.
+- A failed upload can leave the card in a wedged PM state until reboot
+  (subsequent writes return Permission denied). Reboot restores stock
+  behavior - the VBIOS is never touched.
 
 ### Suggested starting values
 

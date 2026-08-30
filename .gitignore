@@ -1,3 +1,4 @@
 patched_pp_table.bin
 r9700-tune
 dist/
+module/r9700_tune.ko

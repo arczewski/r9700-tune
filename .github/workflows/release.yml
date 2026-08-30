@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build static Linux binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+              go build -trimpath \
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o dist/r9700-tune-linux-$arch .
+          done
+
+      - name: Smoke test
+        run: ./dist/r9700-tune-linux-amd64 version
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/r9700-tune-linux-*
+          generate_release_notes: true

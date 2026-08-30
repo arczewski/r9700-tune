@@ -156,3 +156,21 @@ r9700-tune apply patched.bin --power-cap 200
 If the PCI ROM read is blocked on your system, dump the VBIOS another way
 (`/sys/bus/pci/devices/0000:c6:00.0/rom` after `echo 1 > rom`, amdvbflash,
 or GPU-Z) and run `r9700-tune extract-vbios vbios.rom -o pp_table_full.bin`.
+
+## Cards whose VBIOS has no PowerPlay table (R9700 / AI Pro)
+
+On some Pro/AI SKUs the VBIOS contains no `powerplayinfo` atom table at
+all; the full pp_table lives inside the SMU firmware image as a soft
+pptable (SMC firmware header v2.0/v2.1). Extract it from the firmware
+file and verify it against the sysfs dump:
+
+```bash
+ls /lib/firmware/amdgpu/ | grep -i smu      # find e.g. smu_14_0_2.bin
+r9700-tune extract-pptable /lib/firmware/amdgpu/smu_14_0_2.bin \
+  --verify /boot/r9700-tune/pp_table_stock.bin \
+  -o /boot/r9700-tune/pp_table_full.bin
+```
+
+`--verify` compares candidates against the (truncated) sysfs dump; look
+for a candidate with a high byte-match count. Then patch and apply the
+full table as usual.

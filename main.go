@@ -984,6 +984,143 @@ func extractVBios(args []string) error {
 	return analyze(outName)
 }
 
+func extractPPTable(args []string) error {
+	outName := "pp_table_full.bin"
+	verify := ""
+	input := ""
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-o" || a == "--out":
+			i++
+			if i >= len(args) {
+				fatal("missing value for -o")
+			}
+			outName = args[i]
+		case strings.HasPrefix(a, "--out="):
+			outName = strings.TrimPrefix(a, "--out=")
+		case a == "--verify":
+			i++
+			if i >= len(args) {
+				fatal("missing value for --verify")
+			}
+			verify = args[i]
+		case strings.HasPrefix(a, "--verify="):
+			verify = strings.TrimPrefix(a, "--verify=")
+		case a == "-h" || a == "--help":
+			usage()
+			os.Exit(0)
+		case strings.HasPrefix(a, "-") && a != "-":
+			fatal("unknown flag %s", a)
+		default:
+			input = a
+		}
+	}
+	if input == "" {
+		return fmt.Errorf("usage: r9700-tune extract-pptable <firmware.bin> [--verify sysfs_dump.bin] [-o out.bin]")
+	}
+
+	data, err := os.ReadFile(input)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Firmware file: %s (%d bytes)\n", input, len(data))
+
+	type cand struct {
+		off  int
+		size int
+		desc string
+	}
+	var cands []cand
+	seen := map[int]bool{}
+	add := func(c cand) {
+		if c.off < 0 || c.size < 4096 || c.off+c.size > len(data) || seen[c.off] {
+			return
+		}
+		seen[c.off] = true
+		cands = append(cands, c)
+	}
+
+	// SMC firmware header v2.0 / v2.1 (amdgpu_ucode.h)
+	if len(data) >= 48 {
+		major := u16(data, 8)
+		minor := u16(data, 10)
+		if major == 2 && minor == 0 {
+			add(cand{int(u32(data, 40)), int(u32(data, 44)), "SMC firmware header v2.0"})
+		} else if major == 2 && minor == 1 {
+			count := int(u32(data, 40))
+			entryOff := int(u32(data, 44))
+			for i := 0; i < count && i < 16; i++ {
+				o := entryOff + i*12
+				if o+12 > len(data) {
+					break
+				}
+				add(cand{int(u32(data, o+4)), int(u32(data, o+8)),
+					fmt.Sprintf("SMC firmware pptable id %d", u32(data, o))})
+			}
+		} else if major == 2 {
+			fmt.Printf("note: SMC firmware header v2.%d not handled - using raw scan\n", minor)
+		}
+	}
+
+	// raw scan: structuresize 5812, frev 23, pmfw start offset 1344
+	for off := 0; off+4096 <= len(data); off++ {
+		if int(u16(data, off)) == fullSize && data[off+2] == 23 && int(u16(data, off+6)) == 1344 {
+			add(cand{off, fullSize, fmt.Sprintf("raw scan @0x%x", off)})
+		}
+	}
+
+	if len(cands) == 0 {
+		fatal("no PowerPlay table candidate found in %s (no SMC v2.0/v2.1 pptable and no raw scan hit)", input)
+	}
+
+	var dump []byte
+	if verify != "" {
+		dump, err = os.ReadFile(verify)
+		if err != nil {
+			return err
+		}
+	}
+
+	var best *cand
+	bestMatch := -1
+	for i := range cands {
+		c := &cands[i]
+		match := -1
+		if dump != nil {
+			n := min(len(dump), c.size, 4095)
+			match = 0
+			for j := 0; j < n; j++ {
+				if data[c.off+j] != dump[j] {
+					break
+				}
+				match = j + 1
+			}
+		}
+		fmt.Printf("candidate: %s (offset 0x%x, size %d)%s", c.desc, c.off, c.size, "")
+		if dump != nil {
+			fmt.Printf(" - %d/%d bytes match the sysfs dump", match, min(len(dump), c.size, 4095))
+		}
+		fmt.Println()
+		if match > bestMatch {
+			bestMatch = match
+			best = c
+		}
+	}
+
+	if dump != nil && bestMatch < 64 {
+		fmt.Println("WARNING: best candidate matches the sysfs dump poorly - it may be the wrong table")
+	}
+
+	out := append([]byte(nil), data[best.off:best.off+best.size]...)
+	if err := os.WriteFile(outName, out, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("Wrote full PowerPlay table to %s (%d bytes)\n\n", outName, len(out))
+	return analyze(outName)
+}
+
 func usage() {
 	fmt.Printf(`r9700-tune %s - AMD Radeon AI PRO R9700 (Navi 48 / SMU 14.0.2) PowerPlay table tool
 
@@ -991,8 +1128,19 @@ Usage:
   r9700-tune analyze <pp_table.bin>          decode and explain a pp_table dump
   r9700-tune patch [flags] <pp_table.bin>    patch power/clock/fan values
   r9700-tune apply [flags] <pp_table.bin>    upload a table to the GPU (single write)
-  r9700-tune extract-vbios [flags]           extract the FULL pp_table from a VBIOS
+  r9700-tune extract-vbios [flags]           extract the pp_table from a VBIOS ROM
+  r9700-tune extract-pptable [flags]         extract the pp_table from a firmware file
   r9700-tune version                         print version
+
+Extract-pptable flags:
+  <firmware.bin>       firmware image (e.g. /lib/firmware/amdgpu/smu_14_0_2.bin)
+  --verify <dump.bin>  compare candidates against the sysfs pp_table dump
+  -o <file>            output file (default: pp_table_full.bin)
+
+  Some cards (R9700 / AI Pro SKUs) have no PowerPlay atom table in the
+  VBIOS. The full table then lives inside the SMU firmware image as a
+  soft pptable (SMC header v2.0/v2.1). extract-pptable parses the
+  firmware header and/or raw-scans for the table.
 
 Extract-vbios flags:
   <vbios.rom>          VBIOS image file, or
@@ -1045,6 +1193,8 @@ func main() {
 		err = applyTable(os.Args[2:])
 	case "extract-vbios":
 		err = extractVBios(os.Args[2:])
+	case "extract-pptable":
+		err = extractPPTable(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("r9700-tune %s\n", version)
 	case "help", "-h", "--help":

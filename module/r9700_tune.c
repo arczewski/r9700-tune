@@ -1,46 +1,76 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * r9700_tune.c - cap the maximum SCLK on an AMD Radeon AI PRO R9700
- * (Navi 48, SMU 14.0.2) while keeping the automatic DPM range.
+ * r9700_tune.c - SCLK soft-max cap + fan curve / acoustic control for the
+ * AMD Radeon AI PRO R9700 (Navi 48, SMU 14.0.2).
  *
- * Why this exists:
- *  - pp_od_clk_voltage is hidden on this card (OD masks are zero in the
- *    SMU's PowerPlay table), so the normal overdrive path is unavailable.
- *  - pp_table upload is a no-op on SMU 14.0.2 (the driver always re-reads
- *    the table from the SMU and ignores the uploaded copy).
- *  - amdgpu's sysfs/debugfs only allow pinning min=max (constant clock).
+ * The card exposes no usable fan or clock-range controls from userspace:
+ * OD is masked, pp_table uploads are ignored, and sysfs/debugfs can only
+ * pin constant clocks. This module talks to the driver's internal
+ * functions directly:
  *
- * amdgpu internally has amdgpu_dpm_set_soft_freq_range(adev, PP_SCLK,
- * min, max) which sends SMU_MSG_SetSoftMaxByFreq. With min=0 only the
- * soft MAX is changed, so the SMU keeps the automatic range
- * (500 MHz .. sclk_max). The function is not exported, so this module
- * resolves it via kallsyms (kprobe on kallsyms_lookup_name) and captures
- * the amdgpu_device pointer with a kprobe on
- * amdgpu_dpm_force_performance_level (first argument).
+ *  - amdgpu_dpm_set_soft_freq_range(adev, PP_SCLK, 0, max)
+ *      -> SMU_MSG_SetSoftMaxByFreq: automatic range with a lower max
+ *  - smu_v14_0_2_upload_overdrive_table(smu, od_table)
+ *      -> fan curve points, fan target temperature, acoustic target/limit
+ *         RPM, minimum PWM (FeatureCtrlMask bit 4 = FAN_CURVE)
+ *
+ * Non-exported functions are resolved via kallsyms (kprobe on
+ * kallsyms_lookup_name). The amdgpu_device pointer is captured with a
+ * kprobe on amdgpu_dpm_force_performance_level (arg0), the smu_context
+ * pointer with a kprobe on smu_sys_get_pp_table (arg0).
+ *
+ * Struct offsets were computed against the Unraid 6.18.44 kernel tree:
+ *   offsetof(struct smu_context, smu_table)                = 128
+ *   offsetof(struct smu_table_context, overdrive_table)    = 2016
+ *   OverDriveTable_t: FeatureCtrlMask 0, FanLinearPwmPoints 40,
+ *     FanLinearTempPoints 46, FanMinimumPwm 52,
+ *     AcousticTargetRpmThreshold 54, AcousticLimitRpmThreshold 56,
+ *     FanTargetTemperature 58, FanMode 62, size 156
  *
  * Usage:
- *   insmod r9700_tune.ko sclk_max=2000
+ *   insmod r9700_tune.ko sclk_max=2000 \
+ *       fan_target_temp=85 acoustic_target_rpm=1200 \
+ *       acoustic_limit_rpm=1500 fan_min_pwm=15 \
+ *       fan_curve_pwm=15,20,28,38,50,65
  *   echo auto > /sys/class/drm/card0/device/power_dpm_force_performance_level
+ *   cat /sys/class/drm/card0/device/pp_table > /dev/null
  *   echo 2000 > /sys/module/r9700_tune/parameters/sclk_max
+ *   echo 1    > /sys/module/r9700_tune/parameters/fan_apply
  *
- * Change at runtime: write MHz to /sys/module/r9700_tune/parameters/sclk_max
- * Reset: echo auto > /sys/class/drm/card0/device/power_dpm_force_performance_level
- *        (or reboot). Nothing here is persistent.
+ * Reset: echo auto > power_dpm_force_performance_level (clocks) + reboot
+ * (fan settings) - nothing here persists.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/unaligned.h>
 
 #define PP_SCLK 0 /* enum pp_clock_type (kgd_pp_interface.h) */
 
+/* verified offsets (Unraid 6.18.44) */
+#define SMU_TABLE_OFS       128
+#define OVERDRIVE_TABLE_OFS 2016
+#define OD_SIZE             156
+#define OD_BIT_FAN_CURVE    4
+
 static unsigned int sclk_max;
-static unsigned long long fn_addr;    /* override: amdgpu_dpm_set_soft_freq_range */
-static unsigned long long adev_addr;  /* override: amdgpu_device pointer */
+static unsigned long long fn_addr;    /* amdgpu_dpm_set_soft_freq_range */
+static unsigned long long adev_addr;  /* amdgpu_device */
+static unsigned long long fan_fn_addr;/* smu_v14_0_2_upload_overdrive_table */
 static void *adev_ptr;
+static void *smu_ptr;
+
+static unsigned int fan_target_temp;
+static unsigned int acoustic_target_rpm;
+static unsigned int acoustic_limit_rpm;
+static unsigned int fan_min_pwm;
+static char *fan_curve_pwm = "";
 
 typedef int (*set_soft_freq_range_fn)(void *adev, int type, u32 min, u32 max);
+typedef int (*upload_overdrive_fn)(void *smu, void *od_table);
 
 static set_soft_freq_range_fn sfr_fn;
+static upload_overdrive_fn upload_fn;
 
 /* kallsyms_lookup_name is no longer exported; call it through a kprobe. */
 static unsigned long lookup_symbol(const char *name)
@@ -65,14 +95,22 @@ static unsigned long lookup_symbol(const char *name)
 
 #ifdef CONFIG_KPROBES
 /* amdgpu_dpm_force_performance_level(adev, level): capture arg0 (RDI). */
-static int cap_pre(struct kprobe *p, struct pt_regs *regs);
-static struct kprobe cap_kp = {
+static int cap_adev_pre(struct kprobe *p, struct pt_regs *regs);
+static struct kprobe cap_adev_kp = {
 	.symbol_name = "amdgpu_dpm_force_performance_level",
-	.pre_handler = cap_pre,
+	.pre_handler = cap_adev_pre,
 };
-static bool cap_armed;
 
-static int cap_pre(struct kprobe *p, struct pt_regs *regs)
+/* smu_sys_get_pp_table(handle, table): capture arg0 (RDI) = smu_context. */
+static int cap_smu_pre(struct kprobe *p, struct pt_regs *regs);
+static struct kprobe cap_smu_kp = {
+	.symbol_name = "smu_sys_get_pp_table",
+	.pre_handler = cap_smu_pre,
+};
+
+static bool cap_adev_armed, cap_smu_armed;
+
+static int cap_adev_pre(struct kprobe *p, struct pt_regs *regs)
 {
 #if defined(CONFIG_X86_64)
 	if (!adev_ptr)
@@ -80,9 +118,20 @@ static int cap_pre(struct kprobe *p, struct pt_regs *regs)
 #endif
 	return 0;
 }
+
+static int cap_smu_pre(struct kprobe *p, struct pt_regs *regs)
+{
+#if defined(CONFIG_X86_64)
+	if (!smu_ptr)
+		smu_ptr = (void *)regs->di;
+#endif
+	return 0;
+}
 #endif
 
-static int apply(unsigned int mhz)
+/* ------------------------------- SCLK ------------------------------- */
+
+static int apply_sclk(unsigned int mhz)
 {
 	int ret;
 
@@ -117,7 +166,7 @@ static int param_set_sclk_max(const char *val, const struct kernel_param *kp)
 	if (mhz && (mhz < 200 || mhz > 4000))
 		return -EINVAL;
 
-	apply(mhz); /* errors are logged; do not fail insmod before capture */
+	apply_sclk(mhz); /* errors logged; do not fail insmod before capture */
 	sclk_max = mhz;
 	return 0;
 }
@@ -127,40 +176,164 @@ static const struct kernel_param_ops sclk_max_ops = {
 	.get = param_get_uint,
 };
 
+/* -------------------------------- fan ------------------------------- */
+
+static int parse_curve(const char *s, u8 *out, int n)
+{
+	char *dup, *p, *tok;
+	int i;
+
+	dup = kstrdup(s, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+	p = dup;
+	for (i = 0; i < n; i++) {
+		tok = strsep(&p, ",");
+		if (!tok || kstrtou8(tok, 0, &out[i])) {
+			kfree(dup);
+			return -EINVAL;
+		}
+	}
+	kfree(dup);
+	return 0;
+}
+
+static int apply_fan(void)
+{
+	u8 table[OD_SIZE];
+	void **od_pp;
+	u32 mask;
+	int ret;
+
+	if (!upload_fn) {
+		pr_err("r9700_tune: smu_v14_0_2_upload_overdrive_table not resolved\n");
+		return -EIO;
+	}
+	if (!smu_ptr) {
+		pr_info("r9700_tune: smu not captured yet - read the pp_table sysfs once (e.g. cat /sys/class/drm/card0/device/pp_table > /dev/null), then re-apply by writing 1 to /sys/module/r9700_tune/parameters/fan_apply\n");
+		return 0;
+	}
+
+	od_pp = (void **)((u8 *)smu_ptr + SMU_TABLE_OFS + OVERDRIVE_TABLE_OFS);
+	if (!*od_pp) {
+		pr_err("r9700_tune: overdrive_table buffer is NULL\n");
+		return -EIO;
+	}
+	memcpy(table, *od_pp, OD_SIZE);
+	mask = get_unaligned_le32(table + 0);
+
+	if (!fan_target_temp && !acoustic_target_rpm && !acoustic_limit_rpm &&
+	    !fan_min_pwm && !fan_curve_pwm[0]) {
+		pr_info("r9700_tune: no fan settings configured - nothing to do\n");
+		return 0;
+	}
+
+	mask |= 1U << OD_BIT_FAN_CURVE;
+
+	if (fan_target_temp)
+		put_unaligned_le16(fan_target_temp, table + 58);
+	if (acoustic_target_rpm)
+		put_unaligned_le16(acoustic_target_rpm, table + 54);
+	if (acoustic_limit_rpm)
+		put_unaligned_le16(acoustic_limit_rpm, table + 56);
+	if (fan_min_pwm)
+		put_unaligned_le16(fan_min_pwm, table + 52);
+	if (fan_curve_pwm[0]) {
+		u8 pwm[6];
+		static const u8 temps[6] = { 40, 50, 60, 70, 80, 90 };
+
+		if (parse_curve(fan_curve_pwm, pwm, 6)) {
+			pr_err("r9700_tune: bad fan_curve_pwm - expected 6 comma-separated values\n");
+			return -EINVAL;
+		}
+		memcpy(table + 40, pwm, 6);
+		memcpy(table + 46, temps, 6);
+	}
+
+	put_unaligned_le32(mask, table + 0);
+
+	ret = upload_fn(smu_ptr, table);
+	if (ret)
+		pr_err("r9700_tune: overdrive fan upload failed: %d\n", ret);
+	else
+		pr_info("r9700_tune: fan settings applied (target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
+			fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
+
+	return ret;
+}
+
+static int param_set_fan_apply(const char *val, const struct kernel_param *kp)
+{
+	apply_fan(); /* errors logged */
+	return 0;
+}
+
+static const struct kernel_param_ops fan_apply_ops = {
+	.set = param_set_fan_apply,
+	.get = param_get_uint,
+};
+
+static unsigned int fan_apply;
+
+/* ------------------------------- module ------------------------------ */
+
 module_param_cb(sclk_max, &sclk_max_ops, &sclk_max, 0644);
 MODULE_PARM_DESC(sclk_max, "max SCLK in MHz, 0 = no change (default 0)");
+
+module_param_cb(fan_apply, &fan_apply_ops, &fan_apply, 0644);
+MODULE_PARM_DESC(fan_apply, "write anything to apply the fan settings");
+
+module_param(fan_target_temp, uint, 0644);
+MODULE_PARM_DESC(fan_target_temp, "fan target temperature in C (0 = leave)");
+module_param(acoustic_target_rpm, uint, 0644);
+MODULE_PARM_DESC(acoustic_target_rpm, "acoustic target RPM (0 = leave)");
+module_param(acoustic_limit_rpm, uint, 0644);
+MODULE_PARM_DESC(acoustic_limit_rpm, "acoustic limit RPM (0 = leave)");
+module_param(fan_min_pwm, uint, 0644);
+MODULE_PARM_DESC(fan_min_pwm, "minimum fan PWM percent (0 = leave)");
+module_param(fan_curve_pwm, charp, 0644);
+MODULE_PARM_DESC(fan_curve_pwm, "fan curve PWM: p0,p1,p2,p3,p4,p5 at 40..90C (empty = leave)");
+
 module_param(fn_addr, ullong, 0444);
 MODULE_PARM_DESC(fn_addr, "override address of amdgpu_dpm_set_soft_freq_range");
+module_param(fan_fn_addr, ullong, 0444);
+MODULE_PARM_DESC(fan_fn_addr, "override address of smu_v14_0_2_upload_overdrive_table");
 module_param(adev_addr, ullong, 0444);
 MODULE_PARM_DESC(adev_addr, "override amdgpu_device pointer");
 
 static int __init r9700_tune_init(void)
 {
-	unsigned long addr = 0;
+	unsigned long addr;
 
 	addr = fn_addr ? (unsigned long)fn_addr
 		       : lookup_symbol("amdgpu_dpm_set_soft_freq_range");
 	if (!addr) {
-		pr_err("r9700_tune: cannot resolve amdgpu_dpm_set_soft_freq_range (kallsyms hidden or kprobes disabled); pass fn_addr=0x<addr> from /proc/kallsyms\n");
+		pr_err("r9700_tune: cannot resolve amdgpu_dpm_set_soft_freq_range (kallsyms hidden or kprobes disabled); pass fn_addr=0x<addr>\n");
 		return -EINVAL;
 	}
 	sfr_fn = (set_soft_freq_range_fn)(uintptr_t)addr;
 	pr_info("r9700_tune: amdgpu_dpm_set_soft_freq_range @ 0x%lx\n", addr);
 
-	if (adev_addr) {
+	addr = fan_fn_addr ? (unsigned long)fan_fn_addr
+			   : lookup_symbol("smu_v14_0_2_upload_overdrive_table");
+	if (addr)
+		upload_fn = (upload_overdrive_fn)(uintptr_t)addr;
+	else
+		pr_warn("r9700_tune: cannot resolve smu_v14_0_2_upload_overdrive_table - fan control disabled (pass fan_fn_addr=0x<addr> if needed)\n");
+
+	if (adev_addr)
 		adev_ptr = (void *)(uintptr_t)adev_addr;
-		pr_info("r9700_tune: using adev from parameter: %px\n", adev_ptr);
-	}
 
 #ifdef CONFIG_KPROBES
-	if (!adev_ptr) {
-		if (register_kprobe(&cap_kp) == 0) {
-			cap_armed = true;
-			pr_info("r9700_tune: capture probe armed - write power_dpm_force_performance_level once (e.g. echo auto) to capture the device\n");
-		} else {
-			pr_err("r9700_tune: cannot arm capture probe; pass adev_addr=0x<addr> manually\n");
-			return -EINVAL;
-		}
+	if (!adev_ptr && register_kprobe(&cap_adev_kp) == 0)
+		cap_adev_armed = true;
+	if (register_kprobe(&cap_smu_kp) == 0)
+		cap_smu_armed = true;
+	if (!cap_adev_armed && !adev_ptr) {
+		pr_err("r9700_tune: cannot arm capture probes; pass adev_addr=0x<addr> manually\n");
+		unregister_kprobe(&cap_smu_kp);
+		cap_smu_armed = false;
+		return -EINVAL;
 	}
 #else
 	if (!adev_ptr) {
@@ -169,8 +342,10 @@ static int __init r9700_tune_init(void)
 	}
 #endif
 
+	pr_info("r9700_tune: capture probes armed - trigger with: echo auto > power_dpm_force_performance_level AND cat pp_table > /dev/null\n");
+
 	if (sclk_max)
-		apply(sclk_max);
+		apply_sclk(sclk_max);
 
 	return 0;
 }
@@ -178,15 +353,17 @@ static int __init r9700_tune_init(void)
 static void __exit r9700_tune_exit(void)
 {
 #ifdef CONFIG_KPROBES
-	if (cap_armed)
-		unregister_kprobe(&cap_kp);
+	if (cap_adev_armed)
+		unregister_kprobe(&cap_adev_kp);
+	if (cap_smu_armed)
+		unregister_kprobe(&cap_smu_kp);
 #endif
-	pr_info("r9700_tune: unloaded. Reset the cap with: echo auto > /sys/class/drm/card0/device/power_dpm_force_performance_level\n");
+	pr_info("r9700_tune: unloaded. Reset clocks with: echo auto > /sys/class/drm/card0/device/power_dpm_force_performance_level (fan settings reset on reboot)\n");
 }
 
 module_init(r9700_tune_init);
 module_exit(r9700_tune_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Cap max SCLK on AMD Radeon AI PRO R9700 (Navi 48)");
-MODULE_VERSION("0.1");
+MODULE_DESCRIPTION("SCLK soft-max cap and fan/acoustic control for AMD Radeon AI PRO R9700 (Navi 48)");
+MODULE_VERSION("0.2");

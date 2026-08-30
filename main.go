@@ -817,6 +817,144 @@ func applyTable(args []string) error {
 	return nil
 }
 
+func extractVBios(args []string) error {
+	pci := ""
+	outName := "pp_table_full.bin"
+	input := ""
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--pci":
+			i++
+			if i >= len(args) {
+				fatal("missing value for --pci")
+			}
+			pci = args[i]
+		case strings.HasPrefix(a, "--pci="):
+			pci = strings.TrimPrefix(a, "--pci=")
+		case a == "-o" || a == "--out":
+			i++
+			if i >= len(args) {
+				fatal("missing value for -o")
+			}
+			outName = args[i]
+		case strings.HasPrefix(a, "--out="):
+			outName = strings.TrimPrefix(a, "--out=")
+		case a == "-h" || a == "--help":
+			usage()
+			os.Exit(0)
+		case strings.HasPrefix(a, "-") && a != "-":
+			fatal("unknown flag %s", a)
+		default:
+			input = a
+		}
+	}
+
+	var rom []byte
+	if pci != "" {
+		if os.Geteuid() != 0 {
+			fatal("--pci needs root")
+		}
+		romPath := fmt.Sprintf("/sys/bus/pci/devices/%s/rom", pci)
+		if _, err := os.Stat(romPath); err != nil {
+			fatal("cannot access %s: %v", romPath, err)
+		}
+		fmt.Printf("Reading VBIOS via %s ...\n", romPath)
+		if err := os.WriteFile(romPath, []byte("1"), 0o644); err != nil {
+			fatal("could not enable PCI ROM read: %v", err)
+		}
+		defer os.WriteFile(romPath, []byte("0"), 0o644)
+		var err error
+		rom, err = os.ReadFile(romPath)
+		if err != nil {
+			fatal("could not read PCI ROM: %v", err)
+		}
+	} else {
+		if input == "" {
+			return fmt.Errorf("usage: r9700-tune extract-vbios <vbios.rom> | --pci <0000:xx:00.0> [-o out.bin]")
+		}
+		var err error
+		rom, err = os.ReadFile(input)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(rom) < 0x100 {
+		fatal("ROM image too small (%d bytes)", len(rom))
+	}
+
+	// ATOM BIOS layout (kernel atom.h / atom.c):
+	//   rom[0x48]     -> atom ROM header offset
+	//   header+0x04   -> "ATOM" magic
+	//   header+0x20   -> master data table offset (absolute from ROM start)
+	//   mdt+4+i*2     -> u16 table offsets (absolute from ROM start)
+	//   powerplayinfo -> index 15 in the v2.1 master list
+	base := int(u16(rom, 0x48))
+	if base+0x20+2 > len(rom) {
+		fatal("ROM header offset 0x%x out of range", base)
+	}
+	if string(rom[base+4:base+8]) != "ATOM" {
+		fatal("ATOM magic not found at 0x%x (got %q) - not an ATOM VBIOS", base+4, rom[base+4:base+8])
+	}
+	mdt := int(u16(rom, base+0x20))
+	fmt.Printf("ATOM header @0x%x, master data table @0x%x\n", base, mdt)
+
+	find := func(idx int) (int, bool) {
+		o := mdt + 4 + idx*2
+		if o+2 > len(rom) {
+			return 0, false
+		}
+		off := int(u16(rom, o))
+		if off == 0 || off+4 > len(rom) {
+			return 0, false
+		}
+		return off, true
+	}
+
+	var tableOff int
+	// preferred: index 15 (powerplayinfo in master list v2.1)
+	if off, ok := find(15); ok {
+		tableOff = off
+	} else {
+		// fallback: scan all entries for a table with structuresize 5812 / frev 23
+		tableOff = 0
+		for idx := 0; idx < 64; idx++ {
+			off, ok := find(idx)
+			if !ok {
+				continue
+			}
+			if int(u16(rom, off)) == fullSize && rom[off+2] == 23 {
+				tableOff = off
+				fmt.Printf("powerplayinfo not at index 15; found at index %d (offset 0x%x)\n", idx, off)
+				break
+			}
+		}
+	}
+	if tableOff == 0 {
+		fatal("could not locate the PowerPlay table in this ROM image")
+	}
+
+	size := int(u16(rom, tableOff))
+	frev, crev := rom[tableOff+2], rom[tableOff+3]
+	fmt.Printf("PowerPlay table @0x%x: structuresize=%d format_revision=%d content_revision=%d\n",
+		tableOff, size, frev, crev)
+	if tableOff+size > len(rom) {
+		fatal("table (%d bytes @0x%x) exceeds ROM size (%d)", size, tableOff, len(rom))
+	}
+	if size < 4096 {
+		fatal("unexpected table size %d - refusing", size)
+	}
+
+	out := append([]byte(nil), rom[tableOff:tableOff+size]...)
+	if err := os.WriteFile(outName, out, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("Wrote full PowerPlay table to %s (%d bytes)\n\n", outName, size)
+	return analyze(outName)
+}
+
 func usage() {
 	fmt.Printf(`r9700-tune %s - AMD Radeon AI PRO R9700 (Navi 48 / SMU 14.0.2) PowerPlay table tool
 
@@ -824,7 +962,18 @@ Usage:
   r9700-tune analyze <pp_table.bin>          decode and explain a pp_table dump
   r9700-tune patch [flags] <pp_table.bin>    patch power/clock/fan values
   r9700-tune apply [flags] <pp_table.bin>    upload a table to the GPU (single write)
+  r9700-tune extract-vbios [flags]           extract the FULL pp_table from a VBIOS
   r9700-tune version                         print version
+
+Extract-vbios flags:
+  <vbios.rom>          VBIOS image file, or
+  --pci <addr>         read the VBIOS straight from the PCI device ROM (root,
+                       e.g. --pci 0000:c6:00.0)
+  -o <file>            output file (default: pp_table_full.bin)
+
+  The pp_table sysfs node truncates the table at 4095 bytes
+  (PAGE_SIZE-1). extract-vbios recovers the complete table from the
+  VBIOS, including the OD masks and SMU power/fan fields.
 
 Apply flags:
   --gpu <path>       GPU sysfs path (default /sys/class/drm/card0/device)
@@ -865,6 +1014,8 @@ func main() {
 		err = patch(os.Args[2:])
 	case "apply":
 		err = applyTable(os.Args[2:])
+	case "extract-vbios":
+		err = extractVBios(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("r9700-tune %s\n", version)
 	case "help", "-h", "--help":

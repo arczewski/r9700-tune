@@ -135,3 +135,24 @@ patches above achieve the same quietness goals without OD.
 ## License
 
 MIT
+
+## Full pp_table extraction (required on cards with truncated sysfs dump)
+
+The `pp_table` sysfs node caps reads at `PAGE_SIZE-1` (4095 bytes), so on
+cards whose VBIOS table is 5812 bytes the dump is always truncated and
+uploads of patched truncated tables fail or lose the SMU config tail
+(power limits, fan control, VRM settings). Recover the complete table from
+the VBIOS first:
+
+```bash
+# one command: read PCI ROM, extract the PowerPlay table, print the analysis
+r9700-tune extract-vbios --pci 0000:c6:00.0 -o pp_table_full.bin
+
+# then patch the FULL table (all fields available, no --resize needed)
+r9700-tune patch pp_table_full.bin -o patched.bin --max-sclk 2000 --power-limit 200
+r9700-tune apply patched.bin --power-cap 200
+```
+
+If the PCI ROM read is blocked on your system, dump the VBIOS another way
+(`/sys/bus/pci/devices/0000:c6:00.0/rom` after `echo 1 > rom`, amdvbflash,
+or GPU-Z) and run `r9700-tune extract-vbios vbios.rom -o pp_table_full.bin`.

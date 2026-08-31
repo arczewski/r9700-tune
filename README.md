@@ -1,176 +1,199 @@
 # r9700-tune
 
-CLI tool to analyze and patch the AMD Radeon AI PRO R9700 (Navi 48, SMU 14.0.2)
-PowerPlay table on Linux/Unraid. Single static binary, no dependencies.
+Tools to make an AMD Radeon AI PRO R9700 (Navi 48, SMU 14.0.2) quiet on
+Linux/Unraid: cap the maximum GPU clock while keeping the automatic DPM
+range, lower the power limit below the 210 W floor, and apply a custom fan
+curve with acoustic RPM limits.
 
-## Why this tool exists
+Two components:
 
-On Radeon Pro / AI Pro SKUs, the classic overclocking sysfs node
-`pp_od_clk_voltage` is missing. This is not a driver gap: kernel 6.18+ ships a
-complete overdrive implementation for Navi 48, but the driver hides it when
-`OverDriveLimitsBasicMin.FeatureCtrlMask` or
-`OverDriveLimitsBasicMax.FeatureCtrlMask` in the VBIOS PowerPlay table is zero
-(`smu_v14_0_2_check_powerplay_table()` sets `smu->od_enabled = false`).
-Pro cards ship with those masks zeroed, so no kernel upgrade will expose the
-interface.
+1. **`r9700-tune`** - a static Go CLI to analyze and patch PowerPlay
+   tables (`analyze`, `patch`, `extract-vbios`, `extract-pptable`,
+   `apply`).
+2. **`r9700_tune.ko`** - a small kernel module that does what actually
+   works on Navi 48: sets the SCLK soft max, uploads fan/acoustic settings
+   and a percentage power limit offset through the SMU's overdrive table.
 
-However, writing a modified table to the `pp_table` sysfs node triggers an
-SMU reset that re-initializes the card from the uploaded table. That gives us
-safe, fully revertible (reboot = stock) control over:
+---
 
-- **power limit** - `CustomSkuTable.SocketPowerLimitAc/Dc` + `MsgLimits.Power`
-- **max SCLK** - `SkuTable.DriverReportedClocks.GameClockAc` (the driver clamps
-  the max DPM state to this value and pushes it as the SMU soft max)
-- **power1_cap floor** - OD PPT percent trick
-  (`BasicMax.FeatureCtrlMask` PPT bit + `BasicMin.Ppt`)
-- **fan target temperature / acoustic RPM limit** - SMU fan control config
+## Background: why this card is hard to tune
 
-All offsets are verified against the kernel v6.18 headers
-`smu_v14_0_2_pptable.h` and `smu14_driver_if_v14_0.h`.
+The R9700 (Radeon AI PRO, Navi 48) ships with every normal Linux tuning
+interface disabled or non-functional:
 
-## Install
+| Interface | Status on the R9700 |
+|---|---|
+| `pp_od_clk_voltage` (overdrive sysfs) | **Missing.** The driver hides it when `FeatureCtrlMask` of `OverDriveLimitsBasicMin`/`BasicMax` in the SMU PowerPlay table is zero (`smu_v14_0_2_check_powerplay_table()` sets `smu->od_enabled = false`). Pro/AI SKUs ship with those masks zeroed, so no kernel version will expose it - the gate reads data, not code. |
+| `pp_table` sysfs upload | **A no-op on Navi 48.** `smu_v14_0_2_get_pptable_from_pmfw()` always re-fetches the table from the SMU (`TransferTableSmu2Dram`) and never consults the uploaded copy, unlike RDNA1-3. A successful upload changes nothing. |
+| VBIOS PowerPlay table | **Absent.** The 58880-byte VBIOS contains no `powerplayinfo` atom table (master list index 15 is empty), and `smu_14_0_2.bin` has no soft pptable either - the table lives inside the SMU firmware itself. |
+| `power1_cap` | Works (SMU `SetPptLimit`) but enforces a 210 W floor on this board. |
+| `amdgpu_force_sclk` (debugfs) | Calls `SetSoftMinByFreq` + `SetSoftMaxByFreq` with min=max, i.e. pins a constant clock. No range. Rejected with `EINVAL` on this card. |
+| Fan curve / acoustic controls | Exist in the SMU (the same OD fan table Windows Adrenalin uses) but are not reachable from userspace. |
 
-Grab a release binary from the
-[releases page](https://github.com/arczewski/r9700-tune/releases)
-(`r9700-tune-linux-amd64` for Unraid), or build:
+What the SMU does honor, and what this project uses:
 
-```bash
-go build -o r9700-tune .
-```
+- `SetSoftMaxByFreq` - a soft maximum clock; the automatic range below it
+  is preserved (idle still drops to ~500 MHz). This is what
+  `amdgpu_dpm_set_soft_freq_range(adev, PP_SCLK, 0, max)` does internally.
+- The **OD overdrive table upload** (`smu_v14_0_2_upload_overdrive_table`,
+  `TransferTableDram2Smu` with `SMU_TABLE_OVERDRIVE`) - carries the fan
+  curve, fan target temperature, acoustic target/limit RPM, minimum PWM
+  (feature bit 4) and a **percentage power limit offset** `Ppt`
+  (feature bit 3), applied to the board limit - this bypasses the 210 W
+  `power1_cap` floor (e.g. `-50` = 150 W on a 300 W board).
 
-## Usage
+All offsets and behavior were verified against the kernel v6.18 source
+(`drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c`,
+`swsmu/inc/smu_v14_0_2_pptable.h`,
+`swsmu/inc/pmfw_if/smu14_driver_if_v14_0.h`, `pm/amdgpu_dpm.c`,
+`pm/amdgpu_pm.c`, `pm/swsmu/amdgpu_smu.c`) and compiled against the exact
+Unraid 6.18.44 kernel tree.
 
-### Analyze
+---
 
-```bash
-cp /sys/class/drm/card0/device/pp_table /tmp/pp.bin
-r9700-tune analyze /tmp/pp.bin
-```
+## The kernel module (the part that works)
 
-Prints every relevant field (power limits, DPM config, fan table, OD masks)
-and a verdict explaining exactly why the OD interface is hidden on your card.
+`module/r9700_tune.ko` is built for Unraid kernel `6.18.44-Unraid`
+(vermagic `6.18.44-Unraid SMP preempt mod_unload`). It is a runtime-only
+module: nothing persists across reboot, the VBIOS is never touched.
 
-### Patch and apply
+How it works:
 
-```bash
-# cap max SCLK at 2200 MHz and lower the SMU power limit to 170 W
-r9700-tune patch /tmp/pp.bin -o patched.bin --max-sclk 2200 --power-limit 170
+- Resolves the non-exported driver functions via kallsyms
+  (`amdgpu_dpm_set_soft_freq_range`, `smu_v14_0_2_upload_overdrive_table`).
+- Captures the `amdgpu_device` pointer with a kprobe on
+  `amdgpu_dpm_force_performance_level` and the `smu_context` pointer with a
+  kprobe on `smu_sys_get_pp_table`.
+- Calls the soft-max function with `min=0` (only the maximum changes) and
+  uploads an OD table with the fan/power fields.
 
-# upload a table to the GPU (root, single write) and set power cap
-r9700-tune apply patched.bin --power-cap 200
-
-# or patch + upload in one step
-r9700-tune patch /tmp/pp.bin --apply --max-sclk 2200 --power-limit 170
-
-# lower the power1_cap sysfs floor, then use power1_cap directly
-r9700-tune patch /tmp/pp.bin -o patched.bin --ppt-floor 150
-r9700-tune apply patched.bin --power-cap 150
-```
-
-Flags: `--max-sclk`, `--power-limit`, `--ppt-floor`, `--fan-target-temp`,
-`--acoustic-limit-rpm`, `--unlock-od` (VBIOS-flash prep), `--apply`, `--gpu`,
-`--resize`, `-o`. `apply` flags: `--gpu`, `--power-cap <W>`, `--perf-level`.
-
-### Important gotchas
-
-- **Never upload the table with `cat file > /sys/.../pp_table`.** The kernel
-  accepts the table only as a single write syscall whose length matches the
-  `structuresize` header; `cat` on vfat writes in 4096-byte chunks and gets
-  `EIO` (`pp table size not matched` in dmesg). Use `r9700-tune apply`, or
-  `dd if=patched.bin of=/sys/.../pp_table bs=1M` as a fallback.
-- **Short dumps:** some cards expose a 4096-byte table (fields beyond offset
-  4096 are simply absent from the VBIOS and read as zero by the driver).
-  `--max-sclk` works on such dumps. Patches that need the tail
-  (`--power-limit`, `--ppt-floor`, fan flags) require `--resize 5812`,
-  which fabricates the missing fields - the SMU may accept or reject that,
-  so test with dmesg after applying. When in doubt, prefer `--max-sclk`
-  alone plus `power1_cap`.
-- A failed upload can leave the card in a wedged PM state until reboot
-  (subsequent writes return Permission denied). Reboot restores stock
-  behavior - the VBIOS is never touched.
-
-### Suggested starting values
-
-- `--power-limit 170` alone first - the SMU downclocks automatically under
-  load and the fan drops. Most effect for least risk.
-- Still too loud: add `--max-sclk 2200` (or 2100).
-- Prefer sysfs power control: `--ppt-floor 150`, then
-  `echo 150000000 > power1_cap`.
-- Fan tweaks only after the above (`--fan-target-temp 82`, watch hotspot).
-
-### Verify under load
+### Install (Unraid)
 
 ```bash
-cat /sys/kernel/debug/dri/0000:c6:00.0/amdgpu_pm_info
-cat /sys/class/drm/card0/device/pp_dpm_sclk
+mkdir -p /boot/r9700-tune && cd /boot/r9700-tune
+wget -O r9700_tune.ko \
+  https://github.com/arczewski/r9700-tune/releases/download/v1.0.7/r9700_tune-6.18.44-Unraid.ko
+wget -O apply.sh \
+  https://raw.githubusercontent.com/arczewski/r9700-tune/main/module/apply.sh
 ```
 
-### Unraid persistence
+### Usage
 
-See `contrib/r9700_tune.sh` - install as a user script at first array start.
-It uploads the patched table, re-applies the performance level and power cap,
-and logs to `/var/log/r9700_tune.log`.
+```bash
+# quiet default: 2000 MHz cap + relaxed fan curve
+bash /boot/r9700-tune/apply.sh 2000
 
-## Safety
+# or fully customized (env vars override the defaults)
+PPT_OFFSET=-50 \
+FAN_TARGET_TEMP=90 \
+FAN_ACOUSTIC_TARGET=1000 \
+FAN_ACOUSTIC_LIMIT=1300 \
+FAN_MIN_PWM=10 \
+FAN_CURVE_PWM=10,13,16,22,30,42 \
+bash /boot/r9700-tune/apply.sh 1200
+```
 
-- Everything is runtime-only. Delete the patched file / disable the script and
-  reboot to return to stock. Keep a dump of the original table.
-- The upload triggers a brief SMU reset (a few seconds, no output on a
-  headless card).
-- The tool refuses writes whose `structuresize` header does not match the
-  blob size, keeps it consistent automatically, and can extend a 4096-byte
-  dump to the full 5812-byte layout (`--resize 5812` is the default).
-- Do not modify `PFE_Settings.FeaturesToRun`, `DpmDescriptor`, `platform_caps`
-  or the outer `overdrive_table` caps - this tool does not touch them.
+| Setting | Env var | Meaning |
+|---|---|---|
+| Max SCLK | positional arg | soft max in MHz (automatic range below it) |
+| Power limit offset | `PPT_OFFSET` | percent on the board limit: `-30`=210 W, `-40`=180 W, `-50`=150 W, `-60`=120 W (0 = leave) |
+| Fan target temperature | `FAN_TARGET_TEMP` | °C the fan controller aims for (default 85) |
+| Acoustic target RPM | `FAN_ACOUSTIC_TARGET` | quiet-mode target RPM (default 1200) |
+| Acoustic limit RPM | `FAN_ACOUSTIC_LIMIT` | upper RPM bound for the fan (default 1600) |
+| Minimum PWM | `FAN_MIN_PWM` | floor for fan duty, % (default 15) |
+| Fan curve | `FAN_CURVE_PWM` | 6 PWM % values at 40/50/60/70/80/90 °C (default `15,20,28,38,50,65`) |
 
-## Why no `pp_od_clk_voltage` after patching?
+Runtime adjustment without reloading:
 
-The sysfs node is created only at driver load. A runtime pp_table upload can
-flip `smu->od_enabled`, but the node does not appear until the driver is
-reloaded, and reload loses the uploaded table. A permanent OD unlock requires
-the modified FeatureCtrlMasks to be present in the VBIOS at boot
-(`--unlock-od` prepares those bytes; flashing is out of scope). The table
-patches above achieve the same quietness goals without OD.
+```bash
+echo 1800 > /sys/module/r9700_tune/parameters/sclk_max   # change clock cap
+echo 1    > /sys/module/r9700_tune/parameters/fan_apply  # re-apply OD settings
+```
+
+Module parameters: `sclk_max`, `fan_apply` (trigger), `fan_target_temp`,
+`acoustic_target_rpm`, `acoustic_limit_rpm`, `fan_min_pwm`,
+`fan_curve_pwm`, `ppt_offset`, plus overrides `fn_addr`, `fan_fn_addr`,
+`adev_addr` for restricted kernels.
+
+### Reset / safety
+
+```bash
+# remove the clock cap (fan/ppt settings remain until reboot)
+echo auto > /sys/class/drm/card0/device/power_dpm_force_performance_level
+
+# everything back to stock
+rmmod r9700_tune && reboot
+```
+
+Nothing is persistent. Watch temperatures the first hour after a fan
+change - the card is safe up to ~105 °C, keep the hotspot below ~95 °C for
+long-term comfort. If it runs hotter than you like, raise the curve.
+
+### Boot persistence (Unraid)
+
+User Scripts -> Add New Script, schedule "At First Array Start":
+
+```bash
+#!/bin/bash
+PPT_OFFSET=-50 FAN_TARGET_TEMP=90 FAN_ACOUSTIC_TARGET=1000 FAN_ACOUSTIC_LIMIT=1300 FAN_MIN_PWM=10 FAN_CURVE_PWM=10,13,16,22,30,42 bash /boot/r9700-tune/apply.sh 1200
+```
+
+The script waits for amdgpu, skips cleanly if the card or module file is
+missing, and fails safe on kernel mismatches (stock behavior).
+
+### Kernel updates
+
+The `.ko` is tied to `6.18.44-Unraid`; after an Unraid kernel update it
+will refuse to load (safe - card runs stock). Rebuild:
+
+```bash
+# build against the matching prebuilt Unraid kernel tree
+# (get the URL from https://github.com/ich777/unraid_kernel/releases)
+cd module
+make -C <extracted-unraid-kernel-tree> M=$PWD modules
+```
+
+---
+
+## The CLI (`r9700-tune`)
+
+Static Go binary, no dependencies. Useful for analyzing/repairing
+PowerPlay tables on cards where that path works (RDNA1-3, consumer
+RDNA4) and for extracting tables from VBIOS/firmware images.
+
+```bash
+r9700-tune analyze <pp_table.bin>       # decode a pp_table dump
+r9700-tune patch  <pp_table.bin> [flags]  # patch power/clock/fan fields
+r9700-tune apply  <pp_table.bin> [flags]  # single-write upload to the GPU
+r9700-tune extract-vbios <rom|--pci>      # pull the pp_table from a VBIOS
+r9700-tune extract-pptable <fw.bin>       # pull a soft pptable from firmware
+```
+
+Important caveats discovered while building it:
+
+- The `pp_table` sysfs read is clamped to `PAGE_SIZE-1` (4095 bytes), so
+  dumps of 5812-byte tables are always truncated.
+- `cat file > pp_table` fails with `EIO`: the kernel accepts the table
+  only as a single write whose length matches the `structuresize` header.
+  Use `r9700-tune apply` (or `dd bs=1M`).
+- **On Navi 48 the upload is accepted but has no effect** (see table
+  above). Use the kernel module for the R9700.
+
+Release assets include `r9700-tune-linux-amd64` and
+`r9700-tune-linux-arm64`.
+
+---
+
+## Results on the R9700 (reference numbers)
+
+| Setting | SCLK under load | Power | Temp |
+|---|---|---|---|
+| stock (210 W cap) | 2350 MHz | ~209 W | 70-75 °C |
+| 2000 MHz cap | ~1950 MHz | ~165 W | 38-46 °C (old fan curve) |
+| 1200 MHz cap + 150 W limit | ~1200 MHz | ~100-120 W | depends on fan curve |
+
+---
 
 ## License
 
-MIT
-
-## Full pp_table extraction (required on cards with truncated sysfs dump)
-
-The `pp_table` sysfs node caps reads at `PAGE_SIZE-1` (4095 bytes), so on
-cards whose VBIOS table is 5812 bytes the dump is always truncated and
-uploads of patched truncated tables fail or lose the SMU config tail
-(power limits, fan control, VRM settings). Recover the complete table from
-the VBIOS first:
-
-```bash
-# one command: read PCI ROM, extract the PowerPlay table, print the analysis
-r9700-tune extract-vbios --pci 0000:c6:00.0 -o pp_table_full.bin
-
-# then patch the FULL table (all fields available, no --resize needed)
-r9700-tune patch pp_table_full.bin -o patched.bin --max-sclk 2000 --power-limit 200
-r9700-tune apply patched.bin --power-cap 200
-```
-
-If the PCI ROM read is blocked on your system, dump the VBIOS another way
-(`/sys/bus/pci/devices/0000:c6:00.0/rom` after `echo 1 > rom`, amdvbflash,
-or GPU-Z) and run `r9700-tune extract-vbios vbios.rom -o pp_table_full.bin`.
-
-## Cards whose VBIOS has no PowerPlay table (R9700 / AI Pro)
-
-On some Pro/AI SKUs the VBIOS contains no `powerplayinfo` atom table at
-all; the full pp_table lives inside the SMU firmware image as a soft
-pptable (SMC firmware header v2.0/v2.1). Extract it from the firmware
-file and verify it against the sysfs dump:
-
-```bash
-ls /lib/firmware/amdgpu/ | grep -i smu      # find e.g. smu_14_0_2.bin
-r9700-tune extract-pptable /lib/firmware/amdgpu/smu_14_0_2.bin \
-  --verify /boot/r9700-tune/pp_table_stock.bin \
-  -o /boot/r9700-tune/pp_table_full.bin
-```
-
-`--verify` compares candidates against the (truncated) sysfs dump; look
-for a candidate with a high byte-match count. Then patch and apply the
-full table as usual.
+MIT. The kernel module is GPL-2.0 (as required for a kernel module).

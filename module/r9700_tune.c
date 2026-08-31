@@ -52,6 +52,7 @@
 #define OVERDRIVE_TABLE_OFS 2016
 #define OD_SIZE             156
 #define OD_BIT_FAN_CURVE    4
+#define OD_BIT_PPT          3
 
 static unsigned int sclk_max;
 static unsigned long long fn_addr;    /* amdgpu_dpm_set_soft_freq_range */
@@ -65,6 +66,7 @@ static unsigned int acoustic_target_rpm;
 static unsigned int acoustic_limit_rpm;
 static unsigned int fan_min_pwm;
 static char *fan_curve_pwm = "";
+static int ppt_offset; /* percent, applied via the OD Ppt field */
 
 typedef int (*set_soft_freq_range_fn)(void *adev, int type, u32 min, u32 max);
 typedef int (*upload_overdrive_fn)(void *smu, void *od_table);
@@ -223,12 +225,23 @@ static int apply_fan(void)
 	mask = get_unaligned_le32(table + 0);
 
 	if (!fan_target_temp && !acoustic_target_rpm && !acoustic_limit_rpm &&
-	    !fan_min_pwm && !fan_curve_pwm[0]) {
-		pr_info("r9700_tune: no fan settings configured - nothing to do\n");
+	    !fan_min_pwm && !fan_curve_pwm[0] && !ppt_offset) {
+		pr_info("r9700_tune: no OD settings configured - nothing to do\n");
 		return 0;
 	}
 
-	mask |= 1U << OD_BIT_FAN_CURVE;
+	if (fan_target_temp || acoustic_target_rpm || acoustic_limit_rpm ||
+	    fan_min_pwm || fan_curve_pwm[0])
+		mask |= 1U << OD_BIT_FAN_CURVE;
+
+	if (ppt_offset) {
+		if (ppt_offset < -60 || ppt_offset > 20) {
+			pr_err("r9700_tune: ppt_offset %d out of range [-60, +20]\n", ppt_offset);
+			return -EINVAL;
+		}
+		mask |= 1U << OD_BIT_PPT;
+		put_unaligned_le16((u16)(s16)ppt_offset, table + 36);
+	}
 
 	if (fan_target_temp)
 		put_unaligned_le16(fan_target_temp, table + 58);
@@ -254,10 +267,10 @@ static int apply_fan(void)
 
 	ret = upload_fn(smu_ptr, table);
 	if (ret)
-		pr_err("r9700_tune: overdrive fan upload failed: %d\n", ret);
+		pr_err("r9700_tune: overdrive upload failed: %d\n", ret);
 	else
-		pr_info("r9700_tune: fan settings applied (target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
-			fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
+		pr_info("r9700_tune: OD settings applied (ppt %d%%, fan target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
+			ppt_offset, fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
 
 	return ret;
 }
@@ -293,6 +306,8 @@ module_param(fan_min_pwm, uint, 0644);
 MODULE_PARM_DESC(fan_min_pwm, "minimum fan PWM percent (0 = leave)");
 module_param(fan_curve_pwm, charp, 0644);
 MODULE_PARM_DESC(fan_curve_pwm, "fan curve PWM: p0,p1,p2,p3,p4,p5 at 40..90C (empty = leave)");
+module_param(ppt_offset, int, 0644);
+MODULE_PARM_DESC(ppt_offset, "power limit offset in percent (e.g. -50 = 150 W on a 300 W board; 0 = leave)");
 
 module_param(fn_addr, ullong, 0444);
 MODULE_PARM_DESC(fn_addr, "override address of amdgpu_dpm_set_soft_freq_range");
@@ -366,4 +381,4 @@ module_exit(r9700_tune_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SCLK soft-max cap and fan/acoustic control for AMD Radeon AI PRO R9700 (Navi 48)");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");

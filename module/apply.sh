@@ -16,6 +16,7 @@ FAN_ACOUSTIC_TARGET="${FAN_ACOUSTIC_TARGET:-1200}"
 FAN_ACOUSTIC_LIMIT="${FAN_ACOUSTIC_LIMIT:-1600}"
 FAN_MIN_PWM="${FAN_MIN_PWM:-15}"
 FAN_CURVE_PWM="${FAN_CURVE_PWM:-15,20,28,38,50,65}"
+PPT_OFFSET="${PPT_OFFSET:-0}"   # e.g. -50 = 150 W on a 300 W board; 0 = leave
 
 GPU=/sys/class/drm/card0/device
 MOD=/boot/r9700-tune/r9700_tune.ko
@@ -39,7 +40,7 @@ if ! grep -q r9700_tune /proc/modules; then
     ADDR=$(grep -w "$SYM" /proc/kallsyms | awk '{print $1}' | head -1)
     ARGS="sclk_max=$MHZ fan_target_temp=$FAN_TARGET_TEMP \
 acoustic_target_rpm=$FAN_ACOUSTIC_TARGET acoustic_limit_rpm=$FAN_ACOUSTIC_LIMIT \
-fan_min_pwm=$FAN_MIN_PWM fan_curve_pwm=$FAN_CURVE_PWM"
+fan_min_pwm=$FAN_MIN_PWM fan_curve_pwm=$FAN_CURVE_PWM ppt_offset=$PPT_OFFSET"
     if [ -n "$ADDR" ] && [ "$ADDR" != "0000000000000000" ]; then
         insmod "$MOD" fn_addr="0x$ADDR" $ARGS || { echo "insmod failed (kernel mismatch?) - skipping"; exit 0; }
     else
@@ -65,9 +66,9 @@ else
 fi
 
 if echo 1 > "$PARAM/fan_apply" 2>/dev/null; then
-    echo "fan settings applied (target ${FAN_TARGET_TEMP}C, acoustic ${FAN_ACOUSTIC_TARGET}/${FAN_ACOUSTIC_LIMIT} RPM, min ${FAN_MIN_PWM}%)"
+    echo "OD settings applied (ppt ${PPT_OFFSET}%, fan target ${FAN_TARGET_TEMP}C, acoustic ${FAN_ACOUSTIC_TARGET}/${FAN_ACOUSTIC_LIMIT} RPM, min ${FAN_MIN_PWM}%)"
 else
-    echo "warning: could not apply fan settings - check dmesg"
+    echo "warning: could not apply OD settings - check dmesg"
 fi
 
 echo "Reset any time: echo auto > $GPU/power_dpm_force_performance_level (clocks); reboot resets fan"

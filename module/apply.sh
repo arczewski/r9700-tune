@@ -58,6 +58,17 @@ echo auto > "$GPU/power_dpm_force_performance_level" 2>/dev/null || true
 cat "$GPU/pp_table" > /dev/null 2>&1 || true
 sleep 1
 
+# update runtime params (harmless on a fresh load, needed for re-runs)
+for kv in "fan_target_temp:$FAN_TARGET_TEMP" \
+          "acoustic_target_rpm:$FAN_ACOUSTIC_TARGET" \
+          "acoustic_limit_rpm:$FAN_ACOUSTIC_LIMIT" \
+          "fan_min_pwm:$FAN_MIN_PWM" \
+          "fan_curve_pwm:$FAN_CURVE_PWM" \
+          "ppt_offset:$PPT_OFFSET"; do
+    name="${kv%%:*}"; val="${kv#*:}"
+    echo "$val" > "$PARAM/$name" 2>/dev/null || true
+done
+
 # apply
 if echo "$MHZ" > "$PARAM/sclk_max" 2>/dev/null; then
     echo "SCLK soft max = $MHZ MHz"

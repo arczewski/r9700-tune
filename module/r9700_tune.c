@@ -266,11 +266,23 @@ static int apply_fan(void)
 	put_unaligned_le32(mask, table + 0);
 
 	ret = upload_fn(smu_ptr, table);
+	if (ret && (mask & (1U << OD_BIT_PPT))) {
+		/* PPT bit is rejected on some Pro boards; retry without it so
+		 * the fan settings still land. The SMU keeps fan settings from
+		 * the previous upload when the retry is fan-only. */
+		pr_warn("r9700_tune: OD upload with PPT failed: %d - retrying fan-only (power limit will not apply)\n", ret);
+		mask &= ~(1U << OD_BIT_PPT);
+		put_unaligned_le32(mask, table);
+		ret = upload_fn(smu_ptr, table);
+	}
 	if (ret)
 		pr_err("r9700_tune: overdrive upload failed: %d\n", ret);
-	else
+	else if (mask & (1U << OD_BIT_PPT))
 		pr_info("r9700_tune: OD settings applied (ppt %d%%, fan target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
 			ppt_offset, fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
+	else
+		pr_info("r9700_tune: fan settings applied (fan target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
+			fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
 
 	return ret;
 }
@@ -381,4 +393,4 @@ module_exit(r9700_tune_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SCLK soft-max cap and fan/acoustic control for AMD Radeon AI PRO R9700 (Navi 48)");
-MODULE_VERSION("0.3");
+MODULE_VERSION("0.4");

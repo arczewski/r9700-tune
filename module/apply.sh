@@ -20,6 +20,7 @@ PPT_OFFSET="${PPT_OFFSET:-0}"   # e.g. -50 = 150 W on a 300 W board; 0 = leave
 POWER_CAP="${POWER_CAP:-210}"     # power1_cap in W (210 = firmware floor, 300 = max)
 MCLK_MAX="${MCLK_MAX:-0}"         # max MCLK in MHz (stock 1258; e.g. 1058 = -200)
 VDDGFX_OFFSET="${VDDGFX_OFFSET:-0}" # undervolt in mV, negative (e.g. -50; may be rejected)
+OD_APPLY="${OD_APPLY:-1}"          # 1 = apply fan/voltage OD uploads, 0 = clocks + power cap only
 
 GPU=/sys/class/drm/card0/device
 MOD=/boot/r9700-tune/r9700_tune.ko
@@ -62,6 +63,7 @@ cat "$GPU/pp_table" > /dev/null 2>&1 || true
 sleep 1
 
 # update runtime params (harmless on a fresh load, needed for re-runs)
+if [ "$OD_APPLY" != "0" ]; then
 for kv in "fan_target_temp:$FAN_TARGET_TEMP" \
           "acoustic_target_rpm:$FAN_ACOUSTIC_TARGET" \
           "acoustic_limit_rpm:$FAN_ACOUSTIC_LIMIT" \
@@ -73,6 +75,9 @@ for kv in "fan_target_temp:$FAN_TARGET_TEMP" \
     name="${kv%%:*}"; val="${kv#*:}"
     echo "$val" > "$PARAM/$name" 2>/dev/null || true
 done
+else
+    echo "$MCLK_MAX" > "$PARAM/mclk_max" 2>/dev/null || true
+fi
 
 # apply
 if echo "$MHZ" > "$PARAM/sclk_max" 2>/dev/null; then
@@ -81,10 +86,14 @@ else
     echo "warning: could not apply SCLK cap - check dmesg"
 fi
 
+if [ "$OD_APPLY" != "0" ]; then
 if echo 1 > "$PARAM/fan_apply" 2>/dev/null; then
     echo "OD settings applied (ppt ${PPT_OFFSET}%, fan target ${FAN_TARGET_TEMP}C, acoustic ${FAN_ACOUSTIC_TARGET}/${FAN_ACOUSTIC_LIMIT} RPM, min ${FAN_MIN_PWM}%)"
 else
     echo "warning: could not apply OD settings - check dmesg"
+fi
+else
+    echo "OD uploads skipped (OD_APPLY=0) - stock fan curve"
 fi
 
 # power1_cap (210-300 W on the R9700; the 210 W floor is firmware-enforced)

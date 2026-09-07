@@ -17,6 +17,7 @@ FAN_ACOUSTIC_LIMIT="${FAN_ACOUSTIC_LIMIT:-1600}"
 FAN_MIN_PWM="${FAN_MIN_PWM:-15}"
 FAN_CURVE_PWM="${FAN_CURVE_PWM:-15,20,28,38,50,65}"
 PPT_OFFSET="${PPT_OFFSET:-0}"   # e.g. -50 = 150 W on a 300 W board; 0 = leave
+POWER_CAP="${POWER_CAP:-210}"     # power1_cap in W (210 = firmware floor, 300 = max)
 
 GPU=/sys/class/drm/card0/device
 MOD=/boot/r9700-tune/r9700_tune.ko
@@ -80,6 +81,13 @@ if echo 1 > "$PARAM/fan_apply" 2>/dev/null; then
     echo "OD settings applied (ppt ${PPT_OFFSET}%, fan target ${FAN_TARGET_TEMP}C, acoustic ${FAN_ACOUSTIC_TARGET}/${FAN_ACOUSTIC_LIMIT} RPM, min ${FAN_MIN_PWM}%)"
 else
     echo "warning: could not apply OD settings - check dmesg"
+fi
+
+# power1_cap (210-300 W on the R9700; the 210 W floor is firmware-enforced)
+if echo "$((POWER_CAP * 1000000))" > "$GPU/hwmon/hwmon4/power1_cap" 2>/dev/null; then
+    echo "power1_cap set to $POWER_CAP W"
+else
+    echo "warning: could not set power1_cap - check the hwmon path"
 fi
 
 echo "Reset any time: echo auto > $GPU/power_dpm_force_performance_level (clocks); reboot resets fan"

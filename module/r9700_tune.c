@@ -46,6 +46,7 @@
 #include <linux/unaligned.h>
 
 #define PP_SCLK 0 /* enum pp_clock_type (kgd_pp_interface.h) */
+#define PP_MCLK 1
 
 /* verified offsets (Unraid 6.18.44) */
 #define SMU_TABLE_OFS       128
@@ -53,8 +54,10 @@
 #define OD_SIZE             156
 #define OD_BIT_FAN_CURVE    4
 #define OD_BIT_PPT          3
+#define OD_BIT_VF_CURVE     0
 
 static unsigned int sclk_max;
+static unsigned int mclk_max;
 static unsigned long long fn_addr;    /* amdgpu_dpm_set_soft_freq_range */
 static unsigned long long adev_addr;  /* amdgpu_device */
 static unsigned long long fan_fn_addr;/* smu_v14_0_2_upload_overdrive_table */
@@ -67,6 +70,7 @@ static unsigned int acoustic_limit_rpm;
 static unsigned int fan_min_pwm;
 static char *fan_curve_pwm = "";
 static int ppt_offset; /* percent, applied via the OD Ppt field */
+static int vddgfx_offset; /* mV, applied via the OD VF curve offset */
 
 typedef int (*set_soft_freq_range_fn)(void *adev, int type, u32 min, u32 max);
 typedef int (*upload_overdrive_fn)(void *smu, void *od_table);
@@ -131,31 +135,62 @@ static int cap_smu_pre(struct kprobe *p, struct pt_regs *regs)
 }
 #endif
 
-/* ------------------------------- SCLK ------------------------------- */
+/* ------------------------------- clocks ------------------------------ */
 
-static int apply_sclk(unsigned int mhz)
+static int apply_clk_range(unsigned int max_mhz, int type, const char *what)
 {
 	int ret;
 
-	if (!mhz)
+	if (!max_mhz)
 		return 0;
 	if (!sfr_fn) {
 		pr_err("r9700_tune: amdgpu_dpm_set_soft_freq_range not resolved\n");
 		return -EIO;
 	}
 	if (!adev_ptr) {
-		pr_info("r9700_tune: device not captured yet - write power_dpm_force_performance_level once (e.g. echo auto), then re-apply by writing %u to /sys/module/r9700_tune/parameters/sclk_max\n", mhz);
+		pr_info("r9700_tune: device not captured yet - write power_dpm_force_performance_level once (e.g. echo auto), then re-apply by writing %u to the %s parameter\n", max_mhz, what);
 		return 0;
 	}
 
-	ret = sfr_fn(adev_ptr, PP_SCLK, 0, mhz);
+	ret = sfr_fn(adev_ptr, type, 0, max_mhz);
 	if (ret)
-		pr_err("r9700_tune: set_soft_freq_range(min=0, max=%u MHz) failed: %d\n", mhz, ret);
+		pr_err("r9700_tune: set_soft_freq_range(min=0, max=%u MHz, %s) failed: %d\n", max_mhz, what, ret);
 	else
-		pr_info("r9700_tune: SCLK soft max set to %u MHz (automatic range below preserved)\n", mhz);
+		pr_info("r9700_tune: %s soft max set to %u MHz (automatic range below preserved)\n", what, max_mhz);
 
 	return ret;
 }
+
+static int apply_sclk(unsigned int mhz)
+{
+	return apply_clk_range(mhz, PP_SCLK, "SCLK");
+}
+
+static int apply_mclk(unsigned int mhz)
+{
+	return apply_clk_range(mhz, PP_MCLK, "MCLK");
+}
+
+static int param_set_mclk_max(const char *val, const struct kernel_param *kp)
+{
+	unsigned int mhz;
+	int ret;
+
+	ret = kstrtouint(val, 0, &mhz);
+	if (ret)
+		return ret;
+	if (mhz && (mhz < 100 || mhz > 3000))
+		return -EINVAL;
+
+	apply_mclk(mhz);
+	mclk_max = mhz;
+	return 0;
+}
+
+static const struct kernel_param_ops mclk_max_ops = {
+	.set = param_set_mclk_max,
+	.get = param_get_uint,
+};
 
 static int param_set_sclk_max(const char *val, const struct kernel_param *kp)
 {
@@ -225,7 +260,7 @@ static int apply_fan(void)
 	mask = get_unaligned_le32(table + 0);
 
 	if (!fan_target_temp && !acoustic_target_rpm && !acoustic_limit_rpm &&
-	    !fan_min_pwm && !fan_curve_pwm[0] && !ppt_offset) {
+	    !fan_min_pwm && !fan_curve_pwm[0] && !ppt_offset && !vddgfx_offset) {
 		pr_info("r9700_tune: no OD settings configured - nothing to do\n");
 		return 0;
 	}
@@ -233,6 +268,16 @@ static int apply_fan(void)
 	if (fan_target_temp || acoustic_target_rpm || acoustic_limit_rpm ||
 	    fan_min_pwm || fan_curve_pwm[0])
 		mask |= 1U << OD_BIT_FAN_CURVE;
+
+	if (vddgfx_offset) {
+		if (vddgfx_offset < -150 || vddgfx_offset > 0) {
+			pr_err("r9700_tune: vddgfx_offset %d out of range [-150, 0]\n", vddgfx_offset);
+			return -EINVAL;
+		}
+		mask |= 1U << OD_BIT_VF_CURVE;
+		for (int i = 0; i < 6; i++)
+			put_unaligned_le16((u16)(s16)vddgfx_offset, table + 4 + 2 * i);
+	}
 
 	if (ppt_offset) {
 		if (ppt_offset < -60 || ppt_offset > 20) {
@@ -267,19 +312,22 @@ static int apply_fan(void)
 
 	ret = upload_fn(smu_ptr, table);
 	if (ret && (mask & (1U << OD_BIT_PPT))) {
-		/* PPT bit is rejected on some Pro boards; retry without it so
-		 * the fan settings still land. The SMU keeps fan settings from
-		 * the previous upload when the retry is fan-only. */
-		pr_warn("r9700_tune: OD upload with PPT failed: %d - retrying fan-only (power limit will not apply)\n", ret);
+		pr_warn("r9700_tune: OD upload with PPT failed: %d - retrying without it\n", ret);
 		mask &= ~(1U << OD_BIT_PPT);
+		put_unaligned_le32(mask, table);
+		ret = upload_fn(smu_ptr, table);
+	}
+	if (ret && (mask & (1U << OD_BIT_VF_CURVE))) {
+		pr_warn("r9700_tune: OD upload with voltage offset failed: %d - retrying without it\n", ret);
+		mask &= ~(1U << OD_BIT_VF_CURVE);
 		put_unaligned_le32(mask, table);
 		ret = upload_fn(smu_ptr, table);
 	}
 	if (ret)
 		pr_err("r9700_tune: overdrive upload failed: %d\n", ret);
-	else if (mask & (1U << OD_BIT_PPT))
-		pr_info("r9700_tune: OD settings applied (ppt %d%%, fan target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
-			ppt_offset, fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
+	else if (mask & (1U << OD_BIT_VF_CURVE))
+		pr_info("r9700_tune: OD settings applied (vddgfx %d mV, fan target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
+			vddgfx_offset, fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
 	else
 		pr_info("r9700_tune: fan settings applied (fan target %u C, acoustic %u/%u RPM, min pwm %u%%)\n",
 			fan_target_temp, acoustic_target_rpm, acoustic_limit_rpm, fan_min_pwm);
@@ -305,6 +353,9 @@ static unsigned int fan_apply;
 module_param_cb(sclk_max, &sclk_max_ops, &sclk_max, 0644);
 MODULE_PARM_DESC(sclk_max, "max SCLK in MHz, 0 = no change (default 0)");
 
+module_param_cb(mclk_max, &mclk_max_ops, &mclk_max, 0644);
+MODULE_PARM_DESC(mclk_max, "max MCLK in MHz, 0 = no change (default 0; stock is 1258)");
+
 module_param_cb(fan_apply, &fan_apply_ops, &fan_apply, 0644);
 MODULE_PARM_DESC(fan_apply, "write anything to apply the fan settings");
 
@@ -320,6 +371,8 @@ module_param(fan_curve_pwm, charp, 0644);
 MODULE_PARM_DESC(fan_curve_pwm, "fan curve PWM: p0,p1,p2,p3,p4,p5 at 40..90C (empty = leave)");
 module_param(ppt_offset, int, 0644);
 MODULE_PARM_DESC(ppt_offset, "power limit offset in percent (e.g. -50 = 150 W on a 300 W board; 0 = leave)");
+module_param(vddgfx_offset, int, 0644);
+MODULE_PARM_DESC(vddgfx_offset, "VDDGFX offset in mV, negative = undervolt (e.g. -50; 0 = leave). May be rejected on Pro boards.");
 
 module_param(fn_addr, ullong, 0444);
 MODULE_PARM_DESC(fn_addr, "override address of amdgpu_dpm_set_soft_freq_range");
@@ -373,6 +426,8 @@ static int __init r9700_tune_init(void)
 
 	if (sclk_max)
 		apply_sclk(sclk_max);
+	if (mclk_max)
+		apply_mclk(mclk_max);
 
 	return 0;
 }
@@ -393,4 +448,4 @@ module_exit(r9700_tune_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SCLK soft-max cap and fan/acoustic control for AMD Radeon AI PRO R9700 (Navi 48)");
-MODULE_VERSION("0.4");
+MODULE_VERSION("0.5");

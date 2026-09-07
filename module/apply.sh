@@ -62,7 +62,7 @@ echo auto > "$GPU/power_dpm_force_performance_level" 2>/dev/null || true
 cat "$GPU/pp_table" > /dev/null 2>&1 || true
 sleep 1
 
-# update runtime params (harmless on a fresh load, needed for re-runs)
+# refresh fan params (so re-runs pick up changed env values)
 if [ "$OD_APPLY" != "0" ]; then
 for kv in "fan_target_temp:$FAN_TARGET_TEMP" \
           "acoustic_target_rpm:$FAN_ACOUSTIC_TARGET" \
@@ -70,22 +70,15 @@ for kv in "fan_target_temp:$FAN_TARGET_TEMP" \
           "fan_min_pwm:$FAN_MIN_PWM" \
           "fan_curve_pwm:$FAN_CURVE_PWM" \
           "ppt_offset:$PPT_OFFSET" \
-          "vddgfx_offset:$VDDGFX_OFFSET" \
-          "mclk_max:$MCLK_MAX"; do
+          "vddgfx_offset:$VDDGFX_OFFSET"; do
     name="${kv%%:*}"; val="${kv#*:}"
     echo "$val" > "$PARAM/$name" 2>/dev/null || true
 done
-else
-    echo "$MCLK_MAX" > "$PARAM/mclk_max" 2>/dev/null || true
 fi
 
-# apply
-if echo "$MHZ" > "$PARAM/sclk_max" 2>/dev/null; then
-    echo "SCLK soft max = $MHZ MHz"
-else
-    echo "warning: could not apply SCLK cap - check dmesg"
-fi
-
+# IMPORTANT: the OD upload (fan table) makes the SMU re-init its DPM
+# state and drop previously set soft frequency limits and the power
+# limit. So the order is: fan upload FIRST, then clocks, then power cap.
 if [ "$OD_APPLY" != "0" ]; then
 if echo 1 > "$PARAM/fan_apply" 2>/dev/null; then
     echo "OD settings applied (ppt ${PPT_OFFSET}%, fan target ${FAN_TARGET_TEMP}C, acoustic ${FAN_ACOUSTIC_TARGET}/${FAN_ACOUSTIC_LIMIT} RPM, min ${FAN_MIN_PWM}%)"
@@ -94,6 +87,17 @@ else
 fi
 else
     echo "OD uploads skipped (OD_APPLY=0) - stock fan curve"
+fi
+sleep 1
+
+# clocks AFTER the OD upload (they get wiped otherwise)
+if echo "$MCLK_MAX" > "$PARAM/mclk_max" 2>/dev/null; then
+    echo "MCLK soft max = $MCLK_MAX MHz"
+fi
+if echo "$MHZ" > "$PARAM/sclk_max" 2>/dev/null; then
+    echo "SCLK soft max = $MHZ MHz"
+else
+    echo "warning: could not apply SCLK cap - check dmesg"
 fi
 
 # power1_cap (210-300 W on the R9700; the 210 W floor is firmware-enforced)
